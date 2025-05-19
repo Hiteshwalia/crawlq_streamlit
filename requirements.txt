@@ -282,7 +282,7 @@ pytz==2024.2
 
 pyuca==1.2
 
-# pywin32==308
+# pywin32
 
 pywin32-ctypes==0.2.3
 
@@ -423,4 +423,3 @@ yapf==0.43.0
 yarl==1.18.3
 
 zipp==3.21.0
-

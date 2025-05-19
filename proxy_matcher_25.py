@@ -1,14 +1,12 @@
-# proxy_matcher_v22.py
+# proxy_matcher_v23.py
 
-# pip install faiss-cpu streamlit transformers rapidfuzz plotly scikit-learn
+# pip install faiss-cpu streamlit transformers sentence-transformers rapidfuzz plotly scikit-learn
 
 
 
 import sys, asyncio
 
-# ─── STREAMLIT EVENT LOOP POLICY ────────────────────────────────────
-
-# Fix “no running event loop” on Windows
+# ─── STREAMLIT EVENT LOOP POLICY FOR WINDOWS ─────────────────────────
 
 if sys.platform.startswith("win"):
 
@@ -21,17 +19,12 @@ import torch
 torch.classes.__path__ = []
 
 
-import os
 
-import pathlib
-
-import re
-
-
+import os, pathlib, re
 
 import streamlit as st
 
-st.set_page_config(page_title="🔍 Advanced Proxy Matcher v22 (FinBERT + Trading Hero LLM)", layout="wide")
+st.set_page_config(page_title="🔍 Advanced Proxy Matcher v23", layout="wide")
 
 
 
@@ -43,159 +36,153 @@ import faiss
 
 from rapidfuzz import fuzz
 
-from transformers import AutoTokenizer, AutoModel
-
 from sklearn.preprocessing import normalize
 
 import plotly.express as pex
 
 
 
-# ─── THEME & CSS ────────────────────────────────────────────────────
+# ─── EMBEDDING ENGINES ───────────────────────────────────────────────
 
-ING_ORANGE    = "#FF6600"
+from transformers import AutoTokenizer, AutoModel
 
-ING_SHADE_MAP = {
-
-    "BOND":      "#FF6600",
-
-    "CDS":       "#FF8C00",
-
-    "CR":        "#FF8C00",
-
-    "FXSPOT":    "#FFA500",
-
-    "FXVOL":     "#FFB74D",
-
-    "IRSWAP":    "#FFC107",
-
-    "IRSWVOL":   "#FFD54F",
-
-    "IR_LINEAR": "#FFE082"
-
-}
-
-st.markdown(f"""
-
-<style>
-
-input[type="range"] {{ accent-color: {ING_ORANGE}; }}
-
-.stButton>button {{
-
-    background-color: {ING_ORANGE};
-
-    color: white;
-
-    font-weight: bold;
-
-}}
-
-.stSidebar .css-1d391kg h2 {{
-
-    color: {ING_ORANGE};
-
-}}
-
-</style>
-
-""", unsafe_allow_html=True)
+from sentence_transformers import SentenceTransformer
 
 
-
-# ─── HEADER & INSTRUCTIONS ─────────────────────────────────────────
-
-st.title("🔍 Advanced Proxy Matcher v22 — Enterprise Edition")
-
-st.markdown("""
-
-**Powered by FinBERT & Trading Hero LLM embeddings**  
-
-1. **Upload** your proxy & universe CSVs (one code per row, no header).  
-
-2. **Auto-detect** asset classes & parse any `shock` fields.  
-
-3. **Configure** business rules & per-field weights.  
-
-4. **Set** **α** (hybrid vs semantic) & **top_k** ANN candidates.  
-
-5. **Run**, inspect per-asset tabs & charts, and **download** your results.
-
-""")
-
-
-
-# ─── LOAD FINBERT/TRADING-HERO LLM ─────────────────────────────────
 
 @st.cache_resource(show_spinner=False)
 
-def load_finbert():
+def load_trading_hero():
 
     tok = AutoTokenizer.from_pretrained("fuchenru/Trading-Hero-LLM")
 
-    mdl = AutoModel.from_pretrained("fuchenru/Trading-Hero-LLM",
+    mdl = AutoModel.from_pretrained(
 
-                                    output_hidden_states=True).eval()
+        "fuchenru/Trading-Hero-LLM",
+
+        output_hidden_states=True
+
+    ).eval()
 
     return tok, mdl
 
 
 
-tokenizer, finbert = load_finbert()
+@st.cache_resource(show_spinner=False)
 
-DIM = finbert.config.hidden_size
+def load_baconnier():
 
-
-
-def finbert_embed(texts: list[str]) -> np.ndarray:
-
-    """Mean-pool last hidden state, then L2 normalize."""
-
-    batches = []
-
-    for i in range(0, len(texts), 32):
-
-        chunk = texts[i:i+32]
-
-        toks  = tokenizer(chunk, padding=True, truncation=True,
-
-                          return_tensors="pt", max_length=128)
-
-        with torch.no_grad():
-
-            out    = finbert(**toks, output_hidden_states=True)
-
-            last   = out.hidden_states[-1]                   # (B,S,H)
-
-            mask   = toks.attention_mask.unsqueeze(-1)       # (B,S,1)
-
-            summed = (last * mask).sum(1)                    # (B,H)
-
-            counts = mask.sum(1).clamp(min=1)                # (B,1)
-
-            embs   = (summed / counts).cpu().numpy()        # (B,H)
-
-        batches.append(embs)
-
-    all_embs = np.vstack(batches)
-
-    return normalize(all_embs, axis=1)
+    return SentenceTransformer("baconnier/Finance2_embedding_small_en-V1.5")
 
 
 
-# ─── FAISS INDEX BUILDERS ──────────────────────────────────────────
+
+
+# ─── CHOOSE EMBEDDING TYPE ───────────────────────────────────────────
+
+st.sidebar.header("🔍 Embedding Engine")
+
+embed_choice = st.sidebar.radio(
+
+    "Select your model:",
+
+    (
+
+        "Light & Fast — Baconnier Finance Small",
+
+        "Dense & Accurate — Trading Hero LLM (FinBERT-style)"
+
+    ),
+
+    index=1
+
+)
+
+if embed_choice.startswith("Light"):
+
+    # lightweight
+
+    bc_model = load_baconnier()
+
+    EMBED_DIM = bc_model.get_sentence_embedding_dimension()
+
+    st.sidebar.markdown(
+
+        "*Baconnier: ~30 MB, fast on CPU/GPU, numerical & text combined.*"
+
+    )
+
+    def embed_texts(texts:list[str]) -> np.ndarray:
+
+        embs = bc_model.encode(texts, convert_to_numpy=True)
+
+        return normalize(embs, axis=1)
+
+else:
+
+    # dense
+
+    tokenizer, finbert = load_trading_hero()
+
+    EMBED_DIM = finbert.config.hidden_size
+
+    st.sidebar.markdown(
+
+        "*Trading Hero LLM: ~700 MB, deep semantic embeddings, slower.*"
+
+    )
+
+    def embed_texts(texts:list[str]) -> np.ndarray:
+
+        # mean-pool last hidden state
+
+        batches = []
+
+        for i in range(0, len(texts), 32):
+
+            chunk = texts[i:i+32]
+
+            toks  = tokenizer(
+
+                chunk, padding=True, truncation=True,
+
+                max_length=128, return_tensors="pt"
+
+            )
+
+            with torch.no_grad():
+
+                out    = finbert(**toks, output_hidden_states=True)
+
+                last   = out.hidden_states[-1]               # (B,S,H)
+
+                mask   = toks.attention_mask.unsqueeze(-1)   # (B,S,1)
+
+                summed = (last * mask).sum(1)                # (B,H)
+
+                cnts   = mask.sum(1).clamp(min=1)            # (B,1)
+
+                embs   = (summed/cnts).cpu().numpy()         # (B,H)
+
+            batches.append(embs)
+
+        return normalize(np.vstack(batches), axis=1)
+
+
+
+# ─── FAISS INDEX BUILDERS ───────────────────────────────────────────
 
 @st.cache_data
 
-def embed_col(df: pd.DataFrame, col: str) -> np.ndarray:
+def embed_col(df:pd.DataFrame, col:str) -> np.ndarray:
 
-    return finbert_embed(df[col].fillna("").astype(str).tolist())
+    return embed_texts(df[col].fillna("").astype(str).tolist())
 
 
 
 @st.cache_resource
 
-def build_ann_idx(df: pd.DataFrame, field: str):
+def build_ann_idx(df:pd.DataFrame, field:str):
 
     embs = embed_col(df, field).astype("float32")
 
@@ -207,13 +194,13 @@ def build_ann_idx(df: pd.DataFrame, field: str):
 
 @st.cache_resource
 
-def build_fullcode_ann(df: pd.DataFrame):
+def build_fullcode_ann(df:pd.DataFrame):
 
     if df.empty:
 
-        return faiss.IndexFlatIP(DIM), np.zeros((0, DIM), dtype="float32")
+        return faiss.IndexFlatIP(EMBED_DIM), np.zeros((0, EMBED_DIM), dtype="float32")
 
-    embs = finbert_embed(df["original"].fillna("").tolist()).astype("float32")
+    embs = embed_texts(df["original"].fillna("").tolist()).astype("float32")
 
     idx  = faiss.IndexFlatIP(embs.shape[1]); idx.add(embs)
 
@@ -293,15 +280,59 @@ ASSET_CONFIG = {
 
                   "ann_field":"curve_name"},
 
-    # alias IRFCVOL → use same config as IRSWVOL
+}
 
-    "IRFCVOL":   {"fields":["method","currency","tenor","shock"],
 
-              "weights":{"method":2,"currency":1,"tenor":1,"shock":2},
 
-              "ann_field":"method"}
+# ─── THEME & CSS ────────────────────────────────────────────────────
+
+ING_ORANGE    = "#FF6600"
+
+ING_SHADE_MAP = {
+
+    "BOND":      "#FF6600",
+
+    "CDS":       "#FF8C00",
+
+    "CR":        "#FF8C00",
+
+    "FXSPOT":    "#FFA500",
+
+    "FXVOL":     "#FFB74D",
+
+    "IRSWAP":    "#FFC107",
+
+    "IRSWVOL":   "#FFD54F",
+
+    "IR_LINEAR": "#FFE082"
 
 }
+
+st.markdown(f"""
+
+<style>
+
+input[type="range"] {{ accent-color: {ING_ORANGE}; }}
+
+.stButton>button {{
+
+    background-color: {ING_ORANGE};
+
+    color: white;
+
+    font-weight: bold;
+
+}}
+
+.stSidebar .css-1d391kg h2 {{
+
+    color: {ING_ORANGE};
+
+}}
+
+</style>
+
+""", unsafe_allow_html=True)
 
 
 
@@ -309,13 +340,13 @@ ASSET_CONFIG = {
 
 logo_paths = [
 
-    pathlib.Path(__file__).resolve().parent / "Inglogo.jpg",
+    pathlib.Path(__file__).resolve().parent/"Inglogo.jpg",
 
-    pathlib.Path.cwd() / "Inglogo.jpg",
+    pathlib.Path.cwd()/"Inglogo.jpg",
 
-    pathlib.Path(__file__).resolve().parent / "proxy" / "Inglogo.jpg",
+    pathlib.Path(__file__).resolve().parent/"proxy"/"Inglogo.jpg",
 
-    pathlib.Path.cwd() / "proxy" / "Inglogo.jpg",
+    pathlib.Path.cwd()/"proxy"/"Inglogo.jpg",
 
 ]
 
@@ -327,7 +358,7 @@ if logo_file:
 
 else:
 
-    st.sidebar.warning("⚠️ ING logo missing—please place Inglogo.jpg beside this script or in proxy/")
+    st.sidebar.warning("⚠️ ING logo missing—add Inglogo.jpg")
 
 
 
@@ -373,27 +404,27 @@ def hybrid_score(px, cd, cfg):
 
         if f=="rating":
 
-            sc=rating_dist(p,c)
+            sc = rating_dist(p,c)
 
         elif f in ("tenor","maturity"):
 
-            a,b=tenor_to_months(p),tenor_to_months(c)
+            a,b = tenor_to_months(p), tenor_to_months(c)
 
-            sc=1-abs(a-b)/max(a,b,1)
+            sc = 1 - abs(a-b)/max(a,b,1)
 
         elif f=="region":
 
-            sc=region_score(p,c)
+            sc = region_score(p,c)
 
         elif f=="shock":
 
-            sc=1.0 if p and p==c else 0.0
+            sc = 1.0 if p and p==c else 0.0
 
         else:
 
-            sc=1.0 if p==c else fuzz.partial_ratio(str(p),str(c))/100
+            sc = 1.0 if p==c else fuzz.partial_ratio(str(p),str(c))/100
 
-        tot+=w*sc; wsum+=w
+        tot += w*sc; wsum += w
 
     return (tot/wsum) if wsum else 0.0
 
@@ -419,7 +450,7 @@ def parse_row(code: str) -> dict:
 
                                   asset="IRSWAP"
 
-    elif a0=="IR" and len(parts)>1 and parts[1].upper() in ("SWVOL","SWAPVOL"):
+    elif a0=="IR" and len(parts)>1 and parts[1].upper() in("SWVOL","SWAPVOL"):
 
                                   asset="IRSWVOL"
 
@@ -431,25 +462,27 @@ def parse_row(code: str) -> dict:
 
     schema={
 
-      "BOND":      ["rating","tenor","seniority","sector","region","currency","covered","shock"],
+      "BOND":["rating","tenor","seniority","sector","region","currency","covered","shock"],
 
-      "CDS":       ["instrument","issuer","currency","seniority","liquidity","maturity","shock"],
+      "CDS":["instrument","issuer","currency","seniority","liquidity","maturity","shock"],
 
-      "FXSPOT":    ["spot","pair","shock"],
+      "FXSPOT":["spot","pair","shock"],
 
-      "FXVOL":     ["smile","type","pair","strike","option_type","tenor","shock"],
+      "FXVOL":["smile","type","pair","strike","option_type","tenor","shock"],
 
-      "IRSWAP":    ["instrument","curve_name","currency","tenor","shock"],
+      "IRSWAP":["instrument","curve_name","currency","tenor","shock"],
 
-      "IRSWVOL":   ["method","currency","tenor","shock"],
+      "IRSWVOL":["method","currency","tenor","shock"],
 
-      "IR_LINEAR": ["instrument","curve_name","rate","currency","tenor","shock"]
+      "IR_LINEAR":["instrument","curve_name","rate","currency","tenor","shock"],
+
+      "IRFCVOL":["method","currency","tenor","shock"],
 
     }
 
     for i,k in enumerate(schema.get(asset,[]), start=1):
 
-        out[k]=parts[i] if i<len(parts) else ""
+        out[k] = parts[i] if i < len(parts) else ""
 
     return out
 
@@ -481,7 +514,7 @@ def apply_business_rules(px, univ, rules):
 
     else:
 
-        df["_boost"]=0.0
+        df["_boost"] = 0.0
 
     return df
 
@@ -497,25 +530,27 @@ def two_stage_match(px, univ, cfg, rules, α, top_k):
 
     ann0, fe = build_fullcode_ann(df)
 
-    q         = finbert_embed([px["original"]]).astype("float32")
+    # choose embed for full-code query
 
-    _, ids    = ann0.search(q, top_k)
+    q = embed_texts([px["original"]]).astype("float32")
 
-    cand      = df.iloc[ids[0]].reset_index(drop=True)
+    _, ids = ann0.search(q, top_k)
 
-    h_scores  = cand.apply(lambda r: hybrid_score(px, r, cfg), axis=1).values
+    cand   = df.iloc[ids[0]].reset_index(drop=True)
 
-    s_scores  = (fe[ids[0]] @ q[0]).flatten() if fe.shape[0]>0 else np.zeros_like(h_scores)
+    h      = cand.apply(lambda r: hybrid_score(px, r, cfg), axis=1).values
 
-    final     = α*h_scores + (1-α)*s_scores + cand["_boost"].values
+    s      = (fe[ids[0]] @ q[0]).flatten() if fe.shape[0]>0 else np.zeros_like(h)
 
-    best_idx  = int(final.argmax())
+    final  = α*h + (1-α)*s + cand["_boost"].values
 
-    return cand.loc[best_idx,"original"], float(final[best_idx])
+    idx    = int(final.argmax())
+
+    return cand.loc[idx,"original"], float(final[idx])
 
 
 
-# ─── CONTROLS & RUN ──────────────────────────────────────────────────
+# ─── CONTROLS & RUN ─────────────────────────────────────────────────
 
 alpha = st.sidebar.slider("Blend α (hybrid vs semantic)", 0.0, 1.0, 0.6, 0.05)
 
@@ -527,7 +562,7 @@ c1, c2 = st.columns(2)
 
 with c1: proxy_u = st.file_uploader("📄 Proxy CSV",   type="csv")
 
-with c2: univ_u  = st.file_uploader("📄 Universe CSV",type="csv")
+with c2: univ_u  = st.file_uploader("📄 Universe CSV", type="csv")
 
 
 
@@ -543,17 +578,17 @@ if proxy_u and univ_u:
 
 
 
-    detected=sorted(px_df["asset"].unique())
+    detected = sorted(px_df["asset"].unique())
 
     st.sidebar.header("🔧 Detected Asset Classes")
 
-    sel=st.sidebar.multiselect("Which to match:",detected,default=detected)
+    sel = st.sidebar.multiselect("Which to match:", detected, default=detected)
 
 
 
     # Business-Rules UI
 
-    rules={}
+    rules = {}
 
     for a in sel:
 
@@ -561,43 +596,47 @@ if proxy_u and univ_u:
 
             st.sidebar.error(f"No config for '{a}'"); continue
 
-        with st.sidebar.expander(f"{a} Business Rules",expanded=False):
+        with st.sidebar.expander(f"{a} Business Rules", expanded=False):
 
-            fields=[f for f in ASSET_CONFIG[a]["fields"] if f!="shock"]
+            fields = [f for f in ASSET_CONFIG[a]["fields"] if f!="shock"]
 
-            req=st.multiselect(f"{a}: require exact on",fields,default=[])
+            req    = st.multiselect(f"{a}: require exact on", fields, default=[])
 
-            prefer={}
+            prefer = {}
 
             for fld in fields:
 
-                vals=un_df[un_df.asset==a][fld].dropna().unique().tolist()
+                vals = un_df[un_df.asset==a][fld].dropna().unique().tolist()
 
-                pv=st.multiselect(f"{a}: prefer {fld}",vals,default=[])
+                pv   = st.multiselect(f"{a}: prefer {fld}", vals, default=[])
 
                 if pv: prefer[fld]=pv
 
-            rules[a]={"require_exact":req,"prefer":prefer}
+            rules[a]={"require_exact":req, "prefer":prefer}
 
 
 
     # Weights UI
 
-    cfgs={}
+    cfgs = {}
 
     for a in sel:
 
         if a not in ASSET_CONFIG: continue
 
-        cfg=ASSET_CONFIG[a].copy()
+        cfg = ASSET_CONFIG[a].copy()
 
-        with st.sidebar.expander(f"{a} Field Weights",expanded=False):
+        with st.sidebar.expander(f"{a} Field Weights", expanded=False):
 
             for fld in cfg["fields"]:
 
-                cfg["weights"][fld]=st.slider(f"{a} · {fld}",0.0,5.0,float(cfg["weights"][fld]),0.1)
+                cfg["weights"][fld] = st.slider(
 
-        cfgs[a]=cfg
+                    f"{a} · {fld}", 0.0, 5.0, float(cfg["weights"][fld]), 0.1
+
+                )
+
+        cfgs[a] = cfg
 
 
 
@@ -611,17 +650,29 @@ if proxy_u and univ_u:
 
             for a,cfg in cfgs.items():
 
-                sub_px=px_df[px_df["asset"]==a]
+                sub_px = px_df[px_df["asset"]==a]
 
-                sub_un=un_df[un_df["asset"]==a].reset_index(drop=True)
+                sub_un = un_df[un_df["asset"]==a].reset_index(drop=True)
 
-                for _,px in sub_px.iterrows():
+                for _, px in sub_px.iterrows():
 
-                    bp,sc=two_stage_match(px,sub_un,cfg,rules,alpha,top_k)
+                    bp, sc = two_stage_match(px, sub_un, cfg, rules, alpha, top_k)
 
-                    out.append({"asset":a,"proxy":px["original"],"best_proxy":bp,"score":round(sc,4),"formula":f"SV({bp})"})
+                    out.append({
 
-        res=pd.DataFrame(out)
+                        "asset":      a,
+
+                        "proxy":      px["original"],
+
+                        "best_proxy": bp,
+
+                        "score":      round(sc,4),
+
+                        "formula":    f"SV({bp})"
+
+                    })
+
+        res = pd.DataFrame(out)
 
         st.success(f"✅ Matched {len(res)} proxies")
 
@@ -629,9 +680,9 @@ if proxy_u and univ_u:
 
         # Global download
 
-        _, colB = st.columns([3,1])
+        _, colb = st.columns([3,1])
 
-        colB.download_button("📥 Download All",
+        colb.download_button("📥 Download All",
 
             data=res.to_csv(index=False).encode("utf-8"),
 
@@ -679,7 +730,13 @@ if proxy_u and univ_u:
 
                 )
 
-                fig_s.update_layout(xaxis=dict(showticklabels=False), margin=dict(t=40,b=20))
+                fig_s.update_layout(
+
+                    xaxis=dict(showticklabels=False),
+
+                    margin=dict(t=40,b=20)
+
+                )
 
                 fig_s.update_traces(marker=dict(size=10, opacity=0.7))
 
